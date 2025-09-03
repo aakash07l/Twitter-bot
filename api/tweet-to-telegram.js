@@ -13,10 +13,12 @@ export default async function handler(req, res) {
       return res.status(400).json({ ok: false, error: "Missing required env vars" });
     }
 
-    const usernames = TARGET_TWITTER_USERNAMES
-      .split(",")
-      .map(u => u.trim().toLowerCase())
-      .filter(u => u.length > 0);
+    const usernames = Array.from(new Set(
+      TARGET_TWITTER_USERNAMES
+        .split(",")
+        .map(u => u.trim().toLowerCase().replace(/^@+/, ""))
+        .filter(u => u.length > 0)
+    ));
 
     if (usernames.length === 0) {
       return res.status(400).json({ ok: false, error: "No valid usernames provided" });
@@ -25,34 +27,126 @@ export default async function handler(req, res) {
     // Redis get
     async function redisGet(key) {
       if (!UPSTASH_REDIS_REST_URL || !UPSTASH_REDIS_REST_TOKEN) return null;
-      const r = await fetch(`${UPSTASH_REDIS_REST_URL}/get/${key}`, {
+      const safeKey = encodeURIComponent(key);
+      const r = await fetch(`${UPSTASH_REDIS_REST_URL}/get/${safeKey}`, {
         headers: { Authorization: `Bearer ${UPSTASH_REDIS_REST_TOKEN}` }
       });
-      const j = await r.json();
+      const j = await r.json().catch(() => null);
       return j?.result ?? null;
     }
 
     // Redis set
     async function redisSet(key, value) {
       if (!UPSTASH_REDIS_REST_URL || !UPSTASH_REDIS_REST_TOKEN) return;
-      await fetch(`${UPSTASH_REDIS_REST_URL}/set/${key}/${value}`, {
+      const safeKey = encodeURIComponent(key);
+      const safeVal = encodeURIComponent(String(value));
+      await fetch(`${UPSTASH_REDIS_REST_URL}/set/${safeKey}/${safeVal}`, {
         headers: { Authorization: `Bearer ${UPSTASH_REDIS_REST_TOKEN}` },
         method: "POST"
-      });
+      }).catch(() => {});
     }
 
-    // Get user id
-    async function getUserId(username) {
-      const r = await fetch(`https://api.twitter.com/2/users/by/username/${username}`, {
-        headers: { Authorization: `Bearer ${TWITTER_BEARER_TOKEN}` }
-      });
-      if (!r.ok) {
-        const text = await r.text().catch(() => "");
-        throw new Error(`Twitter user lookup failed (${r.status}) for @${username}: ${text}`);
+    // Simple sleep helper
+    const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+    // Fetch with retry/backoff for transient errors and rate limits
+    async function fetchWithRetry(url, options = {}, retryConfig = {}) {
+      const {
+        retries = 3,
+        initialDelayMs = 800,
+        maxDelayMs = 10_000,
+        jitter = true,
+        retryOnStatuses = [429, 500, 502, 503, 504]
+      } = retryConfig;
+
+      let attempt = 0;
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        try {
+          const r = await fetch(url, options);
+          if (!r.ok && retryOnStatuses.includes(r.status) && attempt < retries) {
+            attempt++;
+            let delayMs = initialDelayMs * Math.pow(2, attempt - 1);
+            const retryAfter = r.headers?.get?.("retry-after");
+            if (retryAfter) {
+              const retryAfterSeconds = Number(retryAfter);
+              if (!Number.isNaN(retryAfterSeconds) && retryAfterSeconds > 0) {
+                delayMs = Math.max(delayMs, retryAfterSeconds * 1000);
+              }
+            }
+            if (jitter) {
+              const rand = Math.random() * 0.25 + 0.9; // 0.9x - 1.15x
+              delayMs = Math.floor(delayMs * rand);
+            }
+            if (delayMs > maxDelayMs) delayMs = maxDelayMs;
+            await sleep(delayMs);
+            continue;
+          }
+          return r;
+        } catch (e) {
+          if (attempt >= retries) throw e;
+          attempt++;
+          let delayMs = initialDelayMs * Math.pow(2, attempt - 1);
+          if (jitter) {
+            const rand = Math.random() * 0.25 + 0.9;
+            delayMs = Math.floor(delayMs * rand);
+          }
+          if (delayMs > maxDelayMs) delayMs = maxDelayMs;
+          await sleep(delayMs);
+          continue;
+        }
       }
-      const j = await r.json();
-      if (!j?.data?.id) throw new Error("User not found: " + username);
-      return j.data.id;
+    }
+
+    // Batch user id resolver with Redis cache
+    async function getUserIds(usernamesList) {
+      const usernameToId = {};
+      const missing = [];
+      for (const name of usernamesList) {
+        const cached = await redisGet(`twitter_user_id:${name}`);
+        if (cached) {
+          usernameToId[name] = cached;
+        } else {
+          missing.push(name);
+        }
+      }
+
+      if (missing.length > 0) {
+        const chunkSize = 100;
+        for (let i = 0; i < missing.length; i += chunkSize) {
+          const chunk = missing.slice(i, i + chunkSize);
+          const params = new URLSearchParams({ usernames: chunk.join(",") });
+          const url = `https://api.twitter.com/2/users/by?${params}`;
+          const r = await fetchWithRetry(url, {
+            headers: { Authorization: `Bearer ${TWITTER_BEARER_TOKEN}` }
+          }, { retries: 4, initialDelayMs: 1200 });
+          if (!r.ok) {
+            const text = await r.text().catch(() => "");
+            throw new Error(`Twitter user lookup failed (${r.status}) for @${chunk.join(",@")}: ${text}`);
+          }
+          const j = await r.json();
+          const found = Array.isArray(j?.data) ? j.data : [];
+          for (const u of found) {
+            const key = String(u.username || "").toLowerCase();
+            if (key) {
+              usernameToId[key] = String(u.id);
+              // Best-effort cache
+              // no await to avoid serial latency, but maintain order with await Promise.all if needed
+              // here we sequentially await to keep code simple and predictable
+              await redisSet(`twitter_user_id:${key}`, String(u.id));
+            }
+          }
+          // Mark not found ones explicitly as null
+          const foundSet = new Set(found.map(u => String(u.username || "").toLowerCase()));
+          for (const nm of chunk) {
+            if (!foundSet.has(nm) && usernameToId[nm] == null) {
+              usernameToId[nm] = null;
+            }
+          }
+        }
+      }
+
+      return usernameToId;
     }
 
     // Fetch tweets
@@ -64,7 +158,7 @@ export default async function handler(req, res) {
       if (sinceId) params.set("since_id", sinceId);
 
       const url = `https://api.twitter.com/2/users/${userId}/tweets?${params}`;
-      const r = await fetch(url, { headers: { Authorization: `Bearer ${TWITTER_BEARER_TOKEN}` } });
+      const r = await fetchWithRetry(url, { headers: { Authorization: `Bearer ${TWITTER_BEARER_TOKEN}` } }, { retries: 4, initialDelayMs: 1200 });
       if (!r.ok) {
         const text = await r.text().catch(() => "");
         throw new Error(`Twitter tweets fetch failed (${r.status}) for userId=${userId}: ${text}`);
@@ -77,11 +171,11 @@ export default async function handler(req, res) {
     async function sendToTelegram(text) {
       const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
       const body = { chat_id: TELEGRAM_CHAT_ID, text, parse_mode: "HTML" };
-      const r = await fetch(url, {
+      const r = await fetchWithRetry(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body)
-      });
+      }, { retries: 3, initialDelayMs: 800 });
       if (!r.ok) {
         const text = await r.text().catch(() => "");
         throw new Error(`Telegram sendMessage failed (${r.status}): ${text}`);
@@ -90,10 +184,16 @@ export default async function handler(req, res) {
 
     let results = [];
 
+    const usernameToId = await getUserIds(usernames);
+
     for (const username of usernames) {
       try {
         const redisKey = `last_tweet_id:${username}`;
-        const userId = await getUserId(username);
+        const userId = usernameToId[username];
+        if (!userId) {
+          results.push({ username, error: `User not found or lookup failed` });
+          continue;
+        }
         const lastSeenId = await redisGet(redisKey);
         const tweets = await fetchTweets(userId, lastSeenId);
 
@@ -102,15 +202,28 @@ export default async function handler(req, res) {
           continue;
         }
 
-        // sort oldest → newest
-        tweets.sort((a, b) => (a.id > b.id ? 1 : -1));
+        // sort oldest → newest using BigInt-safe comparison
+        tweets.sort((a, b) => {
+          try {
+            const aId = BigInt(a.id);
+            const bId = BigInt(b.id);
+            if (aId === bId) return 0;
+            return aId < bId ? -1 : 1;
+          } catch {
+            return a.id > b.id ? 1 : -1;
+          }
+        });
 
         let newestId = lastSeenId || "0";
         for (const t of tweets) {
           const tweetUrl = `https://twitter.com/${username}/status/${t.id}`;
           const text = `<b>@${username}</b> tweeted:\n\n${escapeHtml(t.text)}\n\n${tweetUrl}`;
           await sendToTelegram(text);
-          if (t.id > newestId) newestId = t.id;
+          try {
+            if (BigInt(t.id) > BigInt(newestId)) newestId = t.id;
+          } catch {
+            if (t.id > newestId) newestId = t.id;
+          }
         }
 
         await redisSet(redisKey, newestId);

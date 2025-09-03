@@ -13,7 +13,14 @@ export default async function handler(req, res) {
       return res.status(400).json({ ok: false, error: "Missing required env vars" });
     }
 
-    const usernames = TARGET_TWITTER_USERNAMES.split(",").map(u => u.trim().toLowerCase());
+    const usernames = TARGET_TWITTER_USERNAMES
+      .split(",")
+      .map(u => u.trim().toLowerCase())
+      .filter(u => u.length > 0);
+
+    if (usernames.length === 0) {
+      return res.status(400).json({ ok: false, error: "No valid usernames provided" });
+    }
 
     // Redis get
     async function redisGet(key) {
@@ -39,6 +46,10 @@ export default async function handler(req, res) {
       const r = await fetch(`https://api.twitter.com/2/users/by/username/${username}`, {
         headers: { Authorization: `Bearer ${TWITTER_BEARER_TOKEN}` }
       });
+      if (!r.ok) {
+        const text = await r.text().catch(() => "");
+        throw new Error(`Twitter user lookup failed (${r.status}) for @${username}: ${text}`);
+      }
       const j = await r.json();
       if (!j?.data?.id) throw new Error("User not found: " + username);
       return j.data.id;
@@ -54,6 +65,10 @@ export default async function handler(req, res) {
 
       const url = `https://api.twitter.com/2/users/${userId}/tweets?${params}`;
       const r = await fetch(url, { headers: { Authorization: `Bearer ${TWITTER_BEARER_TOKEN}` } });
+      if (!r.ok) {
+        const text = await r.text().catch(() => "");
+        throw new Error(`Twitter tweets fetch failed (${r.status}) for userId=${userId}: ${text}`);
+      }
       const j = await r.json();
       return Array.isArray(j?.data) ? j.data : [];
     }
@@ -62,39 +77,47 @@ export default async function handler(req, res) {
     async function sendToTelegram(text) {
       const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
       const body = { chat_id: TELEGRAM_CHAT_ID, text, parse_mode: "HTML" };
-      await fetch(url, {
+      const r = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body)
       });
+      if (!r.ok) {
+        const text = await r.text().catch(() => "");
+        throw new Error(`Telegram sendMessage failed (${r.status}): ${text}`);
+      }
     }
 
     let results = [];
 
     for (const username of usernames) {
-      const redisKey = `last_tweet_id:${username}`;
-      const userId = await getUserId(username);
-      const lastSeenId = await redisGet(redisKey);
-      const tweets = await fetchTweets(userId, lastSeenId);
+      try {
+        const redisKey = `last_tweet_id:${username}`;
+        const userId = await getUserId(username);
+        const lastSeenId = await redisGet(redisKey);
+        const tweets = await fetchTweets(userId, lastSeenId);
 
-      if (tweets.length === 0) {
-        results.push({ username, message: "No new tweets" });
-        continue;
+        if (tweets.length === 0) {
+          results.push({ username, message: "No new tweets" });
+          continue;
+        }
+
+        // sort oldest → newest
+        tweets.sort((a, b) => (a.id > b.id ? 1 : -1));
+
+        let newestId = lastSeenId || "0";
+        for (const t of tweets) {
+          const tweetUrl = `https://twitter.com/${username}/status/${t.id}`;
+          const text = `<b>@${username}</b> tweeted:\n\n${escapeHtml(t.text)}\n\n${tweetUrl}`;
+          await sendToTelegram(text);
+          if (t.id > newestId) newestId = t.id;
+        }
+
+        await redisSet(redisKey, newestId);
+        results.push({ username, posted: tweets.length, last_id: newestId });
+      } catch (userErr) {
+        results.push({ username, error: String(userErr?.message || userErr) });
       }
-
-      // sort oldest → newest
-      tweets.sort((a, b) => (a.id > b.id ? 1 : -1));
-
-      let newestId = lastSeenId || "0";
-      for (const t of tweets) {
-        const tweetUrl = `https://twitter.com/${username}/status/${t.id}`;
-        const text = `<b>@${username}</b> tweeted:\n\n${escapeHtml(t.text)}\n\n${tweetUrl}`;
-        await sendToTelegram(text);
-        if (t.id > newestId) newestId = t.id;
-      }
-
-      await redisSet(redisKey, newestId);
-      results.push({ username, posted: tweets.length, last_id: newestId });
     }
 
     return res.status(200).json({ ok: true, results });

@@ -13,6 +13,17 @@ export default async function handler(req, res) {
       return res.status(400).json({ ok: false, error: "Missing required env vars" });
     }
 
+    // Normalize Twitter bearer token to avoid duplicated prefix and set defaults
+    const normalizedTwitterToken = String(TWITTER_BEARER_TOKEN || "").trim();
+    const twitterAuthHeaderValue = normalizedTwitterToken.toLowerCase().startsWith("bearer ")
+      ? normalizedTwitterToken
+      : `Bearer ${normalizedTwitterToken}`;
+    const TWITTER_API_BASE_URL = process.env.TWITTER_API_BASE_URL || "https://api.twitter.com/2";
+    const defaultTwitterHeaders = {
+      Authorization: twitterAuthHeaderValue,
+      "User-Agent": "tweet-to-telegram/1.0"
+    };
+
     const usernames = Array.from(new Set(
       TARGET_TWITTER_USERNAMES
         .split(",")
@@ -116,9 +127,9 @@ export default async function handler(req, res) {
         for (let i = 0; i < missing.length; i += chunkSize) {
           const chunk = missing.slice(i, i + chunkSize);
           const params = new URLSearchParams({ usernames: chunk.join(",") });
-          const url = `https://api.twitter.com/2/users/by?${params}`;
+          const url = `${TWITTER_API_BASE_URL}/users/by?${params}`;
           const r = await fetchWithRetry(url, {
-            headers: { Authorization: `Bearer ${TWITTER_BEARER_TOKEN}` }
+            headers: defaultTwitterHeaders
           }, { retries: 4, initialDelayMs: 1200 });
           if (!r.ok) {
             const text = await r.text().catch(() => "");
@@ -157,8 +168,8 @@ export default async function handler(req, res) {
       });
       if (sinceId) params.set("since_id", sinceId);
 
-      const url = `https://api.twitter.com/2/users/${userId}/tweets?${params}`;
-      const r = await fetchWithRetry(url, { headers: { Authorization: `Bearer ${TWITTER_BEARER_TOKEN}` } }, { retries: 4, initialDelayMs: 1200 });
+      const url = `${TWITTER_API_BASE_URL}/users/${userId}/tweets?${params}`;
+      const r = await fetchWithRetry(url, { headers: defaultTwitterHeaders }, { retries: 4, initialDelayMs: 1200 });
       if (!r.ok) {
         const text = await r.text().catch(() => "");
         throw new Error(`Twitter tweets fetch failed (${r.status}) for userId=${userId}: ${text}`);

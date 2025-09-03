@@ -1,0 +1,10 @@
+{
+  "name": "tweet-to-telegram",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "dev": "vercel dev",
+    "start": "vercel dev"
+  },
+  "dependencies": {}
+}

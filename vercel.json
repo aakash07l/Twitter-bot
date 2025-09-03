@@ -1,0 +1,14 @@
+{
+  "functions": {
+    "api/tweet-to-telegram.js": {
+      "runtime": "nodejs20.x",
+      "maxDuration": 10
+    }
+  },
+  "crons": [
+    {
+      "path": "/api/tweet-to-telegram",
+      "schedule": "*/5 * * * *"
+    }
+  ]
+}

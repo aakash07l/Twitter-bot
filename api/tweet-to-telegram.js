@@ -9,6 +9,23 @@ export default async function handler(req, res) {
       UPSTASH_REDIS_REST_TOKEN,
     } = process.env;
 
+    // Optional query-driven debug/diagnostics controls
+    const urlObj = (() => {
+      try { return new URL(req?.url || "", "http://localhost"); } catch { return null; }
+    })();
+    const qp = (k) => {
+      const v1 = req?.query?.[k];
+      if (v1 != null) return Array.isArray(v1) ? v1[0] : v1;
+      const v2 = urlObj?.searchParams?.get?.(k);
+      return v2 != null ? v2 : undefined;
+    };
+    const truthy = (v) => ["1","true","yes","on"].includes(String(v).toLowerCase());
+    const debugMode = truthy(qp("debug"));
+    const dryRun = truthy(qp("dry"));
+    const overrideUsernamesRaw = qp("usernames");
+    const limitParam = qp("limit");
+    const includeParam = qp("include"); // comma-separated: e.g. "retweets,replies"
+
     if (!TWITTER_BEARER_TOKEN || !TARGET_TWITTER_USERNAMES || !TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
       return res.status(400).json({ ok: false, error: "Missing required env vars" });
     }
@@ -55,8 +72,9 @@ export default async function handler(req, res) {
 
     let rateLimitedTriggered = false;
 
+    const targetUsernamesStr = overrideUsernamesRaw ? String(overrideUsernamesRaw) : TARGET_TWITTER_USERNAMES;
     const usernames = Array.from(new Set(
-      TARGET_TWITTER_USERNAMES
+      targetUsernamesStr
         .split(",")
         .map(u => u.trim().toLowerCase().replace(/^@+/, ""))
         .filter(u => u.length > 0)
@@ -203,12 +221,28 @@ export default async function handler(req, res) {
       return usernameToId;
     }
 
+    // Tuning: include/exclude and limits
+    const includeTokens = new Set(
+      String(includeParam || "")
+        .split(",")
+        .map(s => s.trim().toLowerCase())
+        .filter(Boolean)
+    );
+    let excludeList = ["replies","retweets"]; // default behavior: exclude both
+    if (includeTokens.has("replies")) excludeList = excludeList.filter(x => x !== "replies");
+    if (includeTokens.has("retweets")) excludeList = excludeList.filter(x => x !== "retweets");
+    let desiredMaxResults = 5;
+    if (limitParam != null) {
+      const n = Number(limitParam);
+      if (Number.isFinite(n) && n >= 1 && n <= 100) desiredMaxResults = Math.floor(n);
+    }
+
     // Fetch tweets
     async function fetchTweets(userId, sinceId) {
       const params = new URLSearchParams({
-        "max_results": "5",
-        "exclude": "replies,retweets"
+        "max_results": String(desiredMaxResults)
       });
+      if (excludeList.length > 0) params.set("exclude", excludeList.join(","));
       if (sinceId) params.set("since_id", sinceId);
 
       const url = `${TWITTER_API_BASE_URL}/users/${userId}/tweets?${params}`;
@@ -223,6 +257,7 @@ export default async function handler(req, res) {
 
     // Send to Telegram
     async function sendToTelegram(text) {
+      if (dryRun) return; // skip network call in dry-run
       const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
       const body = { chat_id: TELEGRAM_CHAT_ID, text, parse_mode: "HTML" };
       const r = await fetchWithRetry(url, {
@@ -270,7 +305,7 @@ export default async function handler(req, res) {
         const tweets = await fetchTweets(userId, lastSeenId);
 
         if (tweets.length === 0) {
-          results.push({ username, message: "No new tweets" });
+          results.push({ username, message: "No new tweets", debug: debugMode ? { exclude: excludeList, max_results: desiredMaxResults } : undefined });
           continue;
         }
 
@@ -299,13 +334,20 @@ export default async function handler(req, res) {
         }
 
         await redisSet(redisKey, newestId);
-        results.push({ username, posted: tweets.length, last_id: newestId });
+        results.push({ username, posted: tweets.length, last_id: newestId, dry_run: dryRun || undefined, debug: debugMode ? { exclude: excludeList, max_results: desiredMaxResults } : undefined });
       } catch (userErr) {
-        results.push({ username, error: String(userErr?.message || userErr) });
+        // surface more context in debug mode
+        const baseErr = String(userErr?.message || userErr);
+        const dbg = debugMode ? {
+          exclude: excludeList,
+          max_results: desiredMaxResults,
+          telegram_chat_id: TELEGRAM_CHAT_ID ? (String(TELEGRAM_CHAT_ID).startsWith("@") ? TELEGRAM_CHAT_ID : "[numeric chat id provided]") : undefined
+        } : undefined;
+        results.push({ username, error: baseErr, debug: dbg });
       }
     }
 
-    return res.status(200).json({ ok: true, results });
+    return res.status(200).json({ ok: true, results, dry_run: dryRun || undefined, debug: debugMode || undefined });
 
   } catch (err) {
     return res.status(500).json({ ok: false, error: String(err?.message || err) });

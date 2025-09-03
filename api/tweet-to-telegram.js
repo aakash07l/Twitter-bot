@@ -2,18 +2,18 @@ export default async function handler(req, res) {
   try {
     const {
       TWITTER_BEARER_TOKEN,
-      TARGET_TWITTER_USERNAME,
+      TARGET_TWITTER_USERNAMES,
       TELEGRAM_BOT_TOKEN,
       TELEGRAM_CHAT_ID,
       UPSTASH_REDIS_REST_URL,
       UPSTASH_REDIS_REST_TOKEN,
     } = process.env;
 
-    if (!TWITTER_BEARER_TOKEN || !TARGET_TWITTER_USERNAME || !TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+    if (!TWITTER_BEARER_TOKEN || !TARGET_TWITTER_USERNAMES || !TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
       return res.status(400).json({ ok: false, error: "Missing required env vars" });
     }
 
-    const redisKey = `last_tweet_id:${TARGET_TWITTER_USERNAME.toLowerCase()}`;
+    const usernames = TARGET_TWITTER_USERNAMES.split(",").map(u => u.trim().toLowerCase());
 
     // Redis get
     async function redisGet(key) {
@@ -40,11 +40,11 @@ export default async function handler(req, res) {
         headers: { Authorization: `Bearer ${TWITTER_BEARER_TOKEN}` }
       });
       const j = await r.json();
-      if (!j?.data?.id) throw new Error("User not found");
+      if (!j?.data?.id) throw new Error("User not found: " + username);
       return j.data.id;
     }
 
-    // Fetch tweets since last seen
+    // Fetch tweets
     async function fetchTweets(userId, sinceId) {
       const params = new URLSearchParams({
         "max_results": "5",
@@ -69,29 +69,36 @@ export default async function handler(req, res) {
       });
     }
 
-    // Main logic
-    const userId = await getUserId(TARGET_TWITTER_USERNAME);
-    const lastSeenId = await redisGet(redisKey);
-    const tweets = await fetchTweets(userId, lastSeenId);
+    let results = [];
 
-    if (tweets.length === 0) {
-      return res.status(200).json({ ok: true, message: "No new tweets" });
+    for (const username of usernames) {
+      const redisKey = `last_tweet_id:${username}`;
+      const userId = await getUserId(username);
+      const lastSeenId = await redisGet(redisKey);
+      const tweets = await fetchTweets(userId, lastSeenId);
+
+      if (tweets.length === 0) {
+        results.push({ username, message: "No new tweets" });
+        continue;
+      }
+
+      // sort oldest → newest
+      tweets.sort((a, b) => (a.id > b.id ? 1 : -1));
+
+      let newestId = lastSeenId || "0";
+      for (const t of tweets) {
+        const tweetUrl = `https://twitter.com/${username}/status/${t.id}`;
+        const text = `<b>@${username}</b> tweeted:\n\n${escapeHtml(t.text)}\n\n${tweetUrl}`;
+        await sendToTelegram(text);
+        if (t.id > newestId) newestId = t.id;
+      }
+
+      await redisSet(redisKey, newestId);
+      results.push({ username, posted: tweets.length, last_id: newestId });
     }
 
-    // Sort oldest → newest
-    tweets.sort((a, b) => (a.id > b.id ? 1 : -1));
+    return res.status(200).json({ ok: true, results });
 
-    let newestId = lastSeenId || "0";
-    for (const t of tweets) {
-      const tweetUrl = `https://twitter.com/${TARGET_TWITTER_USERNAME}/status/${t.id}`;
-      const text = `<b>@${TARGET_TWITTER_USERNAME}</b> tweeted:\n\n${escapeHtml(t.text)}\n\n${tweetUrl}`;
-      await sendToTelegram(text);
-      if (t.id > newestId) newestId = t.id;
-    }
-
-    await redisSet(redisKey, newestId);
-
-    return res.status(200).json({ ok: true, posted: tweets.length, last_id: newestId });
   } catch (err) {
     return res.status(500).json({ ok: false, error: String(err?.message || err) });
   }

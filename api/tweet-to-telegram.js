@@ -40,37 +40,7 @@ export default async function handler(req, res) {
       Authorization: twitterAuthHeaderValue,
       "User-Agent": "tweet-to-telegram/1.0"
     };
-    // Coordinate Twitter rate limiting across invocations via Redis
-    const tokenSuffix = normalizedTwitterToken.slice(-8) || "token";
-    const RATE_LIMIT_KEY = `twitter_rate_limit_blocked_until:${tokenSuffix}`;
-
-    async function getRateLimitBlockedUntilMs() {
-      const raw = await redisGet(RATE_LIMIT_KEY);
-      const n = Number(raw);
-      return Number.isFinite(n) ? n : 0;
-    }
-
-    async function setRateLimitBlockedUntilMs(msEpoch) {
-      if (!msEpoch) return;
-      await redisSet(RATE_LIMIT_KEY, String(msEpoch));
-    }
-
-    function parseRateLimitResetMsFromHeaders(headers) {
-      try {
-        const reset = Number(headers?.get?.("x-rate-limit-reset"));
-        if (Number.isFinite(reset) && reset > 0) {
-          return reset * 1000;
-        }
-        const retryAfter = Number(headers?.get?.("retry-after"));
-        if (Number.isFinite(retryAfter) && retryAfter > 0) {
-          return Date.now() + retryAfter * 1000;
-        }
-      } catch {}
-      // Fallback: 15 minutes
-      return Date.now() + 15 * 60 * 1000;
-    }
-
-    let rateLimitedTriggered = false;
+    // Removed: cross-invocation rate limit coordination to allow instant fetches
 
     const targetUsernamesStr = overrideUsernamesRaw ? String(overrideUsernamesRaw) : TARGET_TWITTER_USERNAMES;
     const usernames = Array.from(new Set(
@@ -78,18 +48,12 @@ export default async function handler(req, res) {
         .split(",")
         .map(u => u.trim().toLowerCase().replace(/^@+/, ""))
         .filter(u => u.length > 0)
-    ));
+    )).slice(0, 5);
 
     if (usernames.length === 0) {
       return res.status(400).json({ ok: false, error: "No valid usernames provided" });
     }
-    // Pre-flight: if rate-limited, avoid hitting Twitter
-    const preflightBlockedUntil = await getRateLimitBlockedUntilMs();
-    if (preflightBlockedUntil && Date.now() < preflightBlockedUntil) {
-      const iso = new Date(preflightBlockedUntil).toISOString();
-      const results = usernames.map(username => ({ username, error: `Twitter rate limited until ${iso}` }));
-      return res.status(200).json({ ok: true, rate_limited_until: iso, results });
-    }
+    // Removed: pre-flight rate-limit gating to ensure instant fetch attempts
 
     // Redis get
     async function redisGet(key) {
@@ -131,11 +95,7 @@ export default async function handler(req, res) {
       while (true) {
         try {
           const r = await fetch(url, options);
-          if (r?.status === 429) {
-            const untilMs = parseRateLimitResetMsFromHeaders(r.headers);
-            await setRateLimitBlockedUntilMs(untilMs);
-            rateLimitedTriggered = true;
-          }
+          // Removed: 429 handling that persisted rate-limit state
           if (!r.ok && retryOnStatuses.includes(r.status) && attempt < retries) {
             attempt++;
             let delayMs = initialDelayMs * Math.pow(2, attempt - 1);
@@ -277,23 +237,11 @@ export default async function handler(req, res) {
     try {
       usernameToId = await getUserIds(usernames);
     } catch (e) {
-      const blockedUntil = await getRateLimitBlockedUntilMs();
-      if (rateLimitedTriggered || (blockedUntil && Date.now() < blockedUntil)) {
-        const iso = blockedUntil ? new Date(blockedUntil).toISOString() : undefined;
-        const perUser = usernames.map(username => ({ username, error: `Twitter rate limited${iso ? ` until ${iso}` : ""}` }));
-        return res.status(200).json({ ok: true, rate_limited_until: iso, results: perUser });
-      }
       const perUser = usernames.map(username => ({ username, error: String(e?.message || e) }));
       return res.status(200).json({ ok: true, results: perUser });
     }
 
     for (const username of usernames) {
-      if (rateLimitedTriggered) {
-        const blockedUntil = await getRateLimitBlockedUntilMs();
-        const iso = blockedUntil ? new Date(blockedUntil).toISOString() : undefined;
-        results.push({ username, error: `Twitter rate limited${iso ? ` until ${iso}` : ""}` });
-        continue;
-      }
       try {
         const redisKey = `last_tweet_id:${username}`;
         const userId = usernameToId[username];

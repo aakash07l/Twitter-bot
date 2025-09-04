@@ -80,6 +80,50 @@ export default async function handler(req, res) {
     // Simple sleep helper
     const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
+    // Rate limit helpers coordinated via Redis (if configured)
+    const nowSeconds = () => Math.floor(Date.now() / 1000);
+
+    async function preflightRateLimit(routeKey, minIntervalMs = 0) {
+      if (!routeKey) return;
+      let waitMs = 0;
+      if (UPSTASH_REDIS_REST_URL && UPSTASH_REDIS_REST_TOKEN) {
+        const untilRaw = await redisGet(`rate_limit_until:${routeKey}`);
+        if (untilRaw != null) {
+          const until = Number(untilRaw);
+          if (Number.isFinite(until)) {
+            const deltaSec = until - nowSeconds();
+            if (deltaSec > 0) waitMs = Math.max(waitMs, deltaSec * 1000 + 200);
+          }
+        }
+        if (minIntervalMs > 0) {
+          const lastMsRaw = await redisGet(`last_call_ms:${routeKey}`);
+          const nowMs = Date.now();
+          if (lastMsRaw != null) {
+            const lastMs = Number(lastMsRaw);
+            if (Number.isFinite(lastMs)) {
+              const delta = nowMs - lastMs;
+              if (delta < minIntervalMs) waitMs = Math.max(waitMs, minIntervalMs - delta);
+            }
+          }
+        }
+      }
+      if (waitMs > 0) await sleep(waitMs);
+      if (UPSTASH_REDIS_REST_URL && UPSTASH_REDIS_REST_TOKEN && minIntervalMs > 0) {
+        await redisSet(`last_call_ms:${routeKey}`, String(Date.now()));
+      }
+    }
+
+    async function recordRateLimitFromResponse(response, routeKey) {
+      if (!routeKey) return;
+      const remainingRaw = response?.headers?.get?.("x-rate-limit-remaining");
+      const resetRaw = response?.headers?.get?.("x-rate-limit-reset");
+      const remaining = Number(remainingRaw);
+      const reset = Number(resetRaw);
+      if (Number.isFinite(remaining) && remaining <= 0 && Number.isFinite(reset) && reset > 0) {
+        await redisSet(`rate_limit_until:${routeKey}`, String(reset));
+      }
+    }
+
     // Fetch with retry/backoff for transient errors and rate limits
     async function fetchWithRetry(url, options = {}, retryConfig = {}) {
       const {
@@ -87,32 +131,53 @@ export default async function handler(req, res) {
         initialDelayMs = 800,
         maxDelayMs = 10_000,
         jitter = true,
-        retryOnStatuses = [429, 500, 502, 503, 504]
+        retryOnStatuses = [429, 500, 502, 503, 504],
+        routeKey = undefined,
+        minIntervalMs = 0
       } = retryConfig;
 
       let attempt = 0;
       // eslint-disable-next-line no-constant-condition
       while (true) {
         try {
+          // Preflight delay if we are currently rate limited or enforcing min interval
+          await preflightRateLimit(routeKey, minIntervalMs);
+
           const r = await fetch(url, options);
-          // Removed: 429 handling that persisted rate-limit state
           if (!r.ok && retryOnStatuses.includes(r.status) && attempt < retries) {
             attempt++;
             let delayMs = initialDelayMs * Math.pow(2, attempt - 1);
             const retryAfter = r.headers?.get?.("retry-after");
-            if (retryAfter) {
-              const retryAfterSeconds = Number(retryAfter);
-              if (!Number.isNaN(retryAfterSeconds) && retryAfterSeconds > 0) {
-                delayMs = Math.max(delayMs, retryAfterSeconds * 1000);
-              }
+            const resetHeader = r.headers?.get?.("x-rate-limit-reset");
+            const nowSec = nowSeconds();
+            let headerWaitMs = 0;
+            const resetSec = Number(resetHeader);
+            if (Number.isFinite(resetSec) && resetSec > nowSec) {
+              headerWaitMs = Math.max(headerWaitMs, (resetSec - nowSec) * 1000 + 200);
             }
+            const retryAfterSec = Number(retryAfter);
+            if (Number.isFinite(retryAfterSec) && retryAfterSec > 0) {
+              headerWaitMs = Math.max(headerWaitMs, retryAfterSec * 1000 + 200);
+            }
+            if (headerWaitMs > 0) delayMs = Math.max(delayMs, headerWaitMs);
             if (jitter) {
               const rand = Math.random() * 0.25 + 0.9; // 0.9x - 1.15x
               delayMs = Math.floor(delayMs * rand);
             }
-            if (delayMs > maxDelayMs) delayMs = maxDelayMs;
+            if (delayMs > maxDelayMs && r.status !== 429) delayMs = maxDelayMs;
+            if (routeKey && r.status === 429) {
+              const untilSec = (Number(resetHeader) && Number(resetHeader) > 0)
+                ? Number(resetHeader)
+                : Math.floor((Date.now() + delayMs) / 1000);
+              if (Number.isFinite(untilSec)) {
+                await redisSet(`rate_limit_until:${routeKey}`, String(untilSec));
+              }
+            }
             await sleep(delayMs);
             continue;
+          }
+          if (r.ok) {
+            if (routeKey) await recordRateLimitFromResponse(r, routeKey);
           }
           return r;
         } catch (e) {
@@ -151,7 +216,7 @@ export default async function handler(req, res) {
           const url = `${TWITTER_API_BASE_URL}/users/by?${params}`;
           const r = await fetchWithRetry(url, {
             headers: defaultTwitterHeaders
-          }, { retries: 4, initialDelayMs: 1200 });
+          }, { retries: 4, initialDelayMs: 1200, routeKey: "users_by", minIntervalMs: 400 });
           if (!r.ok) {
             const text = await r.text().catch(() => "");
             throw new Error(`Twitter user lookup failed (${r.status}) for @${chunk.join(",@")}: ${text}`);
@@ -206,7 +271,7 @@ export default async function handler(req, res) {
       if (sinceId) params.set("since_id", sinceId);
 
       const url = `${TWITTER_API_BASE_URL}/users/${userId}/tweets?${params}`;
-      const r = await fetchWithRetry(url, { headers: defaultTwitterHeaders }, { retries: 4, initialDelayMs: 1200 });
+      const r = await fetchWithRetry(url, { headers: defaultTwitterHeaders }, { retries: 4, initialDelayMs: 1200, routeKey: "users_tweets", minIntervalMs: 400 });
       if (!r.ok) {
         const text = await r.text().catch(() => "");
         throw new Error(`Twitter tweets fetch failed (${r.status}) for userId=${userId}: ${text}`);

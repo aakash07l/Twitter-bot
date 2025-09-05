@@ -26,6 +26,25 @@ export default async function handler(req, res) {
     const limitParam = qp("limit");
     const includeParam = qp("include"); // comma-separated: e.g. "retweets,replies"
 
+    // Global deadline and concurrency controls
+    const timeoutMsRaw = qp("timeout_ms");
+    const timeoutSecRaw = qp("timeout");
+    const fallbackTimeoutMs = Number(process.env.API_TIMEOUT_MS || 9000);
+    let hardTimeoutMs = Number(timeoutMsRaw);
+    if (!Number.isFinite(hardTimeoutMs) || hardTimeoutMs <= 0) {
+      const sec = Number(timeoutSecRaw);
+      hardTimeoutMs = Number.isFinite(sec) && sec > 0 ? Math.floor(sec * 1000) : fallbackTimeoutMs;
+    }
+    // clamp within sensible bounds to avoid extremely small/large timeouts
+    hardTimeoutMs = Math.max(2000, Math.min(55000, hardTimeoutMs));
+    const startedAtMs = Date.now();
+    const deadlineAtMs = startedAtMs + hardTimeoutMs;
+    const remainingMs = () => Math.max(0, deadlineAtMs - Date.now());
+    const isNearDeadline = (bufferMs = 600) => remainingMs() <= bufferMs;
+
+    const concurrencyParam = Number(qp("concurrency"));
+    const concurrencyLimit = Number.isFinite(concurrencyParam) ? Math.max(1, Math.min(5, Math.floor(concurrencyParam))) : 2;
+
     if (!TWITTER_BEARER_TOKEN || !TARGET_TWITTER_USERNAMES || !TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
       return res.status(400).json({ ok: false, error: "Missing required env vars" });
     }
@@ -80,6 +99,15 @@ export default async function handler(req, res) {
     // Simple sleep helper
     const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
+    // Abort controller with per-attempt timeout
+    function createAbortSignalWithTimeout(timeoutMs) {
+      const controller = new AbortController();
+      const id = setTimeout(() => {
+        try { controller.abort(new Error("timeout")); } catch {}
+      }, Math.max(0, timeoutMs));
+      return { signal: controller.signal, cancel: () => clearTimeout(id) };
+    }
+
     // Rate limit helpers coordinated via Redis (if configured)
     const nowSeconds = () => Math.floor(Date.now() / 1000);
 
@@ -107,7 +135,13 @@ export default async function handler(req, res) {
           }
         }
       }
-      if (waitMs > 0) await sleep(waitMs);
+      if (waitMs > 0) {
+        const budget = remainingMs();
+        if (budget <= waitMs + 300) {
+          throw new Error("Insufficient time for preflight wait");
+        }
+        await sleep(Math.min(waitMs, Math.max(0, budget - 300)));
+      }
       if (UPSTASH_REDIS_REST_URL && UPSTASH_REDIS_REST_TOKEN && minIntervalMs > 0) {
         await redisSet(`last_call_ms:${routeKey}`, String(Date.now()));
       }
@@ -133,7 +167,8 @@ export default async function handler(req, res) {
         jitter = true,
         retryOnStatuses = [429, 500, 502, 503, 504],
         routeKey = undefined,
-        minIntervalMs = 0
+        minIntervalMs = 0,
+        perAttemptTimeoutMs = 5000
       } = retryConfig;
 
       let attempt = 0;
@@ -143,7 +178,14 @@ export default async function handler(req, res) {
           // Preflight delay if we are currently rate limited or enforcing min interval
           await preflightRateLimit(routeKey, minIntervalMs);
 
-          const r = await fetch(url, options);
+          const budgetBefore = remainingMs();
+          if (budgetBefore <= 500) {
+            throw new Error("Deadline reached before request");
+          }
+          const attemptTimeout = Math.max(1000, Math.min(perAttemptTimeoutMs, Math.max(500, budgetBefore - 300)));
+          const ac = createAbortSignalWithTimeout(attemptTimeout);
+          const r = await fetch(url, { ...options, signal: ac.signal });
+          ac.cancel();
           if (!r.ok && retryOnStatuses.includes(r.status) && attempt < retries) {
             attempt++;
             let delayMs = initialDelayMs * Math.pow(2, attempt - 1);
@@ -173,6 +215,10 @@ export default async function handler(req, res) {
                 await redisSet(`rate_limit_until:${routeKey}`, String(untilSec));
               }
             }
+            const budgetAfter = remainingMs();
+            if (delayMs >= budgetAfter - 200) {
+              throw new Error("Deadline would be exceeded by backoff delay");
+            }
             await sleep(delayMs);
             continue;
           }
@@ -189,6 +235,10 @@ export default async function handler(req, res) {
             delayMs = Math.floor(delayMs * rand);
           }
           if (delayMs > maxDelayMs) delayMs = maxDelayMs;
+          const budgetAfterCatch = remainingMs();
+          if (delayMs >= budgetAfterCatch - 200) {
+            throw new Error("Deadline would be exceeded by retry backoff");
+          }
           await sleep(delayMs);
           continue;
         }
@@ -296,6 +346,21 @@ export default async function handler(req, res) {
       }
     }
 
+    // Simple concurrency mapper
+    async function mapWithConcurrency(items, limit, mapper) {
+      const results = new Array(items.length);
+      let index = 0;
+      const workers = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, () => (async () => {
+        while (true) {
+          const current = index++;
+          if (current >= items.length) break;
+          results[current] = await mapper(items[current], current);
+        }
+      })());
+      await Promise.all(workers);
+      return results;
+    }
+
     let results = [];
 
     let usernameToId;
@@ -306,20 +371,21 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, results: perUser });
     }
 
-    for (const username of usernames) {
+    const perUserResults = await mapWithConcurrency(usernames, concurrencyLimit, async (username) => {
       try {
+        if (isNearDeadline()) {
+          return { username, error: "Skipped due to deadline" };
+        }
         const redisKey = `last_tweet_id:${username}`;
         const userId = usernameToId[username];
         if (!userId) {
-          results.push({ username, error: `User not found or lookup failed` });
-          continue;
+          return { username, error: `User not found or lookup failed` };
         }
         const lastSeenId = await redisGet(redisKey);
         const tweets = await fetchTweets(userId, lastSeenId);
 
         if (tweets.length === 0) {
-          results.push({ username, message: "No new tweets", debug: debugMode ? { exclude: excludeList, max_results: desiredMaxResults } : undefined });
-          continue;
+          return { username, message: "No new tweets", debug: debugMode ? { exclude: excludeList, max_results: desiredMaxResults } : undefined };
         }
 
         // sort oldest → newest using BigInt-safe comparison
@@ -335,10 +401,13 @@ export default async function handler(req, res) {
         });
 
         let newestId = lastSeenId || "0";
+        let posted = 0;
         for (const t of tweets) {
+          if (isNearDeadline()) break;
           const tweetUrl = `https://twitter.com/${username}/status/${t.id}`;
           const text = `<b>@${username}</b> tweeted:\n\n${escapeHtml(t.text)}\n\n${tweetUrl}`;
           await sendToTelegram(text);
+          posted++;
           try {
             if (BigInt(t.id) > BigInt(newestId)) newestId = t.id;
           } catch {
@@ -346,8 +415,14 @@ export default async function handler(req, res) {
           }
         }
 
-        await redisSet(redisKey, newestId);
-        results.push({ username, posted: tweets.length, last_id: newestId, dry_run: dryRun || undefined, debug: debugMode ? { exclude: excludeList, max_results: desiredMaxResults } : undefined });
+        if (posted > 0) {
+          await redisSet(redisKey, newestId);
+        }
+        const base = { username, posted, last_id: newestId, dry_run: dryRun || undefined, debug: debugMode ? { exclude: excludeList, max_results: desiredMaxResults } : undefined };
+        if (posted < tweets.length) {
+          return { ...base, partial: true, reason: "deadline" };
+        }
+        return base;
       } catch (userErr) {
         // surface more context in debug mode
         const baseErr = String(userErr?.message || userErr);
@@ -356,9 +431,11 @@ export default async function handler(req, res) {
           max_results: desiredMaxResults,
           telegram_chat_id: TELEGRAM_CHAT_ID ? (String(TELEGRAM_CHAT_ID).startsWith("@") ? TELEGRAM_CHAT_ID : "[numeric chat id provided]") : undefined
         } : undefined;
-        results.push({ username, error: baseErr, debug: dbg });
+        return { username, error: baseErr, debug: dbg };
       }
-    }
+    });
+
+    results = perUserResults;
 
     return res.status(200).json({ ok: true, results, dry_run: dryRun || undefined, debug: debugMode || undefined });
 
